@@ -1,17 +1,21 @@
-use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::future::Future;
-use std::path::PathBuf;
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::UNIX_EPOCH;
 use std::{env, fs};
 
 use crate::config::{FilesystemProviderConfig, GlobalAgentConfig};
 use crate::data::extended_decision::{FileContent, FileDecisionGraph, FileTestContent};
 use crate::data::release_data::ReleaseData;
 use crate::immutable_loader::{ImmutableLoader, collect_examples};
-use crate::provider::{AgentData, AgentDataProvider, Project, ProjectDiff};
+use crate::provider::{
+    AgentData, AgentDataProvider, FailedProjectsRegistry, Project, ProjectDiff,
+};
 use anyhow::Context;
-use dashmap::DashMap;
 use itertools::Itertools;
 use tokio::task;
 use walkdir::WalkDir;
@@ -40,12 +44,14 @@ impl AgentDataProvider for FilesystemProvider {
         let root = self.root_dir.clone();
 
         async move {
-            let projects = task::spawn_blocking(move || {
+            let blocking_data = data.clone();
+            let (loaded, removed) = task::spawn_blocking(move || {
+                let data = blocking_data;
                 let directory = match fs::read_dir(root.clone()) {
                     Ok(dir) => dir,
                     Err(error) => {
                         println!("[FS - Skip] Failed to read directory: {}", error);
-                        return DashMap::new();
+                        return (Vec::new(), Vec::new());
                     }
                 };
 
@@ -64,57 +70,116 @@ impl AgentDataProvider for FilesystemProvider {
                     })
                     .collect::<Vec<PathBuf>>();
 
-                paths
-                    .into_iter()
-                    .filter_map(|directory| {
-                        let relative_path = match directory.strip_prefix(root.clone()) {
-                            Ok(ok) => ok,
-                            Err(err) => {
-                                tracing::error!(
-                                    "[FS - Skip] failed to strip prefix on {}: {}",
-                                    directory.display(),
-                                    err
-                                );
-                                return None;
-                            }
-                        };
+                let mut seen: HashSet<String> = HashSet::new();
+                let mut loaded: Vec<(String, Arc<Project>, bool)> = Vec::new();
 
-                        let project = match load_from_directory(&directory) {
-                            Ok(ok) => ok,
-                            Err(err) => {
-                                tracing::error!(
-                                    "[FS - Skip] failed to load project from directory {}: {}",
-                                    directory.display(),
-                                    err
-                                );
-                                return None;
-                            }
-                        };
+                for directory in paths {
+                    let relative_path = match directory.strip_prefix(root.clone()) {
+                        Ok(ok) => ok.to_string_lossy().to_string(),
+                        Err(err) => {
+                            tracing::error!(
+                                "[FS - Skip] failed to strip prefix on {}: {}",
+                                directory.display(),
+                                err
+                            );
+                            continue;
+                        }
+                    };
+                    seen.insert(relative_path.clone());
 
-                        Some((
-                            relative_path.to_string_lossy().to_string(),
-                            Arc::new(project),
-                        ))
-                    })
-                    .collect::<DashMap<_, _>>()
+                    let hash = match fingerprint(&directory) {
+                        Ok(hash) => hash,
+                        Err(err) => {
+                            tracing::error!(
+                                "[FS - Skip] failed to fingerprint {}: {}",
+                                directory.display(),
+                                err
+                            );
+                            continue;
+                        }
+                    };
+
+                    let existing = data.projects.get(&relative_path);
+                    if existing
+                        .as_ref()
+                        .is_some_and(|p| p.content_hash.as_deref() == Some(hash.as_slice()))
+                        || FailedProjectsRegistry::has_failed(Some(hash.as_slice()))
+                    {
+                        // Unchanged since the last poll (or known-broken at this exact content).
+                        continue;
+                    }
+                    let is_new = existing.is_none();
+                    drop(existing);
+
+                    match load_from_directory(&directory, Some(hash.clone())) {
+                        Ok(project) => loaded.push((relative_path, Arc::new(project), is_new)),
+                        Err(err) => {
+                            tracing::error!(
+                                "[FS - Skip] failed to load project from directory {}: {}",
+                                directory.display(),
+                                err
+                            );
+                            FailedProjectsRegistry::insert(hash);
+                        }
+                    }
+                }
+
+                let removed = data
+                    .projects
+                    .iter()
+                    .map(|e| e.key().to_string())
+                    .filter(|key| !seen.contains(key))
+                    .collect::<Vec<_>>();
+
+                (loaded, removed)
             })
             .await?;
 
-            let diff = projects
-                .iter()
-                .map(|project| ProjectDiff::Created(project.key().to_string()))
-                .collect();
-
-            projects.into_iter().for_each(|(key, project)| {
-                let _ = data.projects.insert(key, project);
-            });
+            let mut diff = Vec::with_capacity(loaded.len() + removed.len());
+            for key in removed {
+                data.projects.remove(&key);
+                diff.push(ProjectDiff::Removed(key));
+            }
+            for (key, project, is_new) in loaded {
+                data.projects.insert(key.clone(), project);
+                diff.push(if is_new {
+                    ProjectDiff::Created(key)
+                } else {
+                    ProjectDiff::Updated(key)
+                });
+            }
 
             Ok(diff)
         }
     }
 }
 
-fn load_from_directory(root: &PathBuf) -> anyhow::Result<Project> {
+/// Cheap change detector for a project directory: a hash over every file's relative
+/// path, size and modified time. Equal fingerprints mean there is nothing to reload.
+fn fingerprint(root: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut hasher = DefaultHasher::new();
+    for entry in WalkDir::new(root).sort_by_file_name() {
+        let entry = entry.context("failed to walk directory")?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let meta = entry.metadata().context("failed to read file metadata")?;
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        entry.path().strip_prefix(root).unwrap_or(entry.path()).hash(&mut hasher);
+        meta.len().hash(&mut hasher);
+        modified.hash(&mut hasher);
+    }
+    Ok(hasher.finish().to_le_bytes().to_vec())
+}
+
+fn load_from_directory(
+    root: &PathBuf,
+    content_hash: Option<Vec<u8>>,
+) -> anyhow::Result<Project> {
     let files = WalkDir::new(root.clone())
         .into_iter()
         .filter_ok(|d| d.file_type().is_file())
@@ -162,7 +227,7 @@ fn load_from_directory(root: &PathBuf) -> anyhow::Result<Project> {
 
     Ok(Project {
         engine: ImmutableLoader::new(graphs, examples, release_data).into_engine(),
-        content_hash: None,
+        content_hash,
         rules_spec: OnceLock::new(),
     })
 }
@@ -194,7 +259,7 @@ mod tests {
         }"#;
         fs::write(dir.join("Mixed Case Rule"), graph_json).expect("failed to write graph fixture");
 
-        let result = load_from_directory(&dir);
+        let result = load_from_directory(&dir, None);
 
         // Clean up before asserting so the temp dir is never left behind on failure.
         let _ = fs::remove_dir_all(&dir);
@@ -213,5 +278,24 @@ mod tests {
             .find(|e| e.path.as_ref() == "Mixed Case Rule")
             .expect("expected an entry with the original-cased display path");
         assert_eq!(entry.path.as_ref(), "Mixed Case Rule");
+    }
+
+    #[test]
+    fn fingerprint_changes_only_when_files_change() {
+        let dir = env::temp_dir().join(format!("gorules-agent-fs-fp-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("failed to create temp test dir");
+        fs::write(dir.join("a.json"), "{}").expect("write");
+
+        let first = fingerprint(&dir).expect("fingerprint");
+        assert_eq!(first, fingerprint(&dir).expect("fingerprint"));
+
+        fs::write(dir.join("b.json"), "{}").expect("write");
+        let after_add = fingerprint(&dir).expect("fingerprint");
+        assert_ne!(first, after_add);
+
+        fs::remove_file(dir.join("b.json")).expect("remove");
+        let after_remove = fingerprint(&dir).expect("fingerprint");
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(first, after_remove);
     }
 }
